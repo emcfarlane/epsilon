@@ -14,7 +14,12 @@ This package provides a
 | macOS    | ✅ Supported     |
 | Windows  | ❌ Not Supported |
 
-On non-Unix platforms, `NewWasiModuleBuilder().Build()` returns an error.
+The core WASI logic is platform-agnostic and compiles everywhere; it talks to
+the host only through the `FileSystem`/`File` interfaces (see
+[Filesystem](#filesystem)). The only bundled backend is the syscall-based host
+backend, which is Unix-only, so on non-Unix platforms
+`NewWasiModuleBuilder().Build()` (and `OpenHostFileSystem`/`NewHostFile`) return
+an error unless every preopen and stream is supplied via a custom backend.
 
 ## Usage
 
@@ -33,14 +38,14 @@ func main() {
 	wasm, _ := os.ReadFile("guest.wasm")
 
 	// Open a directory to pre-open for the WASM module
-	dir, _ := os.Open("/path/to/sandbox")
+	fsys, _ := wasip1.OpenHostFileSystem("/path/to/sandbox")
 
 	// Create a WASI module with args, env, and a pre-opened directory
 	wasiModule, _ := wasip1.NewWasiModuleBuilder().
 		WithArgs("guest.wasm", "--verbose", "--count=42").
 		WithEnv("GREETING", "Hello from WASI!").
 		WithEnv("USER", "wasm_user").
-		WithDir("/sandbox", dir).
+		WithFS("/sandbox", fsys).
 		Build()
 	defer wasiModule.Close()
 
@@ -60,6 +65,33 @@ func main() {
 	}
 }
 ```
+
+## Filesystem
+
+The runtime accesses the host through two interfaces (see `wasi_types.go`), so
+the WASI state machine itself is decoupled from the host OS:
+
+- `FileSystem` — a sandboxed, directory-rooted capability. Every WASI directory
+  descriptor (a preopen, or a directory obtained via `path_open`) is one
+  `FileSystem`; all names resolve relative to its root and may never escape it.
+- `File` — an open file, directory, or socket handle. It extends `io/fs.File`
+  with the write, seek, and metadata operations WASI needs.
+
+The default host backend resolves every path relative to the sandbox root using
+`*at` syscalls, enforcing traversal (`..`) and symlink-escape protection without
+ever following a path outside the root. Mount any `FileSystem` (including a
+future virtualized/in-memory one) with `WithFS`; open a host directory with
+`OpenHostFileSystem`:
+
+```go
+// Open a host directory, or supply your own FileSystem.
+fsys, _ := wasip1.OpenHostFileSystem("/path/to/sandbox")
+builder.WithFS("/sandbox", fsys)
+```
+
+Streams (`WithStdin`/`WithStdout`/`WithStderr`) likewise take a `File`; wrap a
+host `*os.File` with `NewHostFile`. The builder takes ownership of every
+`FileSystem`/`File` it is given (the process stdio is never closed).
 
 ## Testing
 
