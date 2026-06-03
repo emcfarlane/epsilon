@@ -177,6 +177,13 @@ type wasmFunction struct {
 	functionType FunctionType
 	module       *ModuleInstance
 	code         function
+	// closures is the closure-dispatch compilation of code.body. closureCompiled
+	// records that compilation was attempted; closuresOK is true when every
+	// opcode was supported and the function runs via closure dispatch (otherwise
+	// it falls back to the switch interpreter).
+	closures        []closureInstr
+	closureCompiled bool
+	closuresOK      bool
 }
 
 func (wf *wasmFunction) GetType() *FunctionType { return &wf.functionType }
