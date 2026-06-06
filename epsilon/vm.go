@@ -82,8 +82,7 @@ type controlFrame struct {
 // is recovered into an error.
 type frame func(c *frameCtx) int
 
-// vmTrap carries a WASM trap (or fuel exhaustion) up through the run loop and
-// any nested calls via panic, until invokeWasmFunction recovers it.
+// vmTrap carries a WASM trap up through the run loop via panic.
 type vmTrap struct{ err error }
 
 type frameCtx struct {
@@ -353,12 +352,25 @@ func (vm *vm) invokeWasmFunction(function *wasmFunction) (err error) {
 		module: function.module,
 	})
 
-	// defer resets the locals and recover turns a vmTrap panic into a returned
-	// error. A non-vmTrap panic is a genuine bug and is re-raised.
+	// To avoid the performance penalty of checking the fuel limit on every
+	// instruction when fuel is disabled, we provide two separate loop
+	// implementations.
+	arity := uint32(len(function.functionType.ResultTypes))
+	c := vm.newFrameCtx(function.frames, arity)
+	if vm.config.EnableFuel {
+		err = vm.runLoopWithFuel(c, function.frames)
+	} else {
+		err = vm.runLoop(c, function.frames)
+	}
+	// The run loop pops this frame before returning, so its locals slots are
+	// free to reuse. Rewinding the cursor here is a no-op for the heap case.
+	vm.localsTop = localsMark
+	vm.callStack = vm.callStack[:len(vm.callStack)-1]
+	return err
+}
+
+func (vm *vm) runLoop(c *frameCtx, code []frame) (err error) {
 	defer func() {
-		// The run loop pops this frame before returning, so its locals slots are
-		// free to reuse. Rewinding the cursor here is a no-op for the heap case.
-		vm.localsTop = localsMark
 		if r := recover(); r != nil {
 			if trap, ok := r.(vmTrap); ok {
 				err = trap.err
@@ -367,39 +379,32 @@ func (vm *vm) invokeWasmFunction(function *wasmFunction) (err error) {
 			}
 		}
 	}()
-
-	// To avoid the performance penalty of checking the fuel limit on every
-	// instruction when fuel is disabled, we provide two separate loop
-	// implementations.
-	arity := uint32(len(function.functionType.ResultTypes))
-	if vm.config.EnableFuel {
-		vm.runLoopWithFuel(function.frames, arity)
-	} else {
-		vm.runLoop(function.frames, arity)
-	}
-	return nil
-}
-
-func (vm *vm) runLoop(code []frame, resultArity uint32) {
-	c := vm.newFrameCtx(code, resultArity)
-	defer func() { vm.callStack = vm.callStack[:len(vm.callStack)-1] }()
 	ip := 0
 	for ip < len(code) {
 		ip = code[ip](c)
 	}
+	return
 }
 
-func (vm *vm) runLoopWithFuel(code []frame, resultArity uint32) {
-	c := vm.newFrameCtx(code, resultArity)
-	defer func() { vm.callStack = vm.callStack[:len(vm.callStack)-1] }()
+func (vm *vm) runLoopWithFuel(c *frameCtx, code []frame) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if trap, ok := r.(vmTrap); ok {
+				err = trap.err
+			} else {
+				panic(r)
+			}
+		}
+	}()
 	ip := 0
 	for ip < len(code) {
 		if vm.fuel == 0 {
-			panic(vmTrap{errFuelExhausted})
+			return errFuelExhausted
 		}
 		vm.fuel--
 		ip = code[ip](c)
 	}
+	return
 }
 
 // operandWordCount returns the number of operand words after the opcode at
@@ -462,8 +467,8 @@ func (vm *vm) newFrameCtx(code []frame, resultArity uint32) *frameCtx {
 	*c = frameCtx{vm: vm, locals: frame.locals, module: frame.module}
 	c.ctrl = append(ctrl, controlFrame{
 		targetIp:    int32(len(code)),
-		arity:       resultArity,
 		stackHeight: vm.stack.size(),
+		arity:       resultArity,
 	})
 	return c
 }
