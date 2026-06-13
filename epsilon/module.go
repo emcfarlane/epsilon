@@ -18,13 +18,6 @@ type function struct {
 	typeIndex uint32
 	locals    []ValueType
 	body      []uint64
-	// jumpCache maps the position of the first instruction inside a block/if to
-	// the position of the instruction after the matching 'end'.
-	jumpCache map[uint32]uint32
-	// jumpElseCache maps the position of the first instruction inside an 'if' to
-	// the position of the instruction after the matching 'else' (or 'end' if no
-	// else).
-	jumpElseCache map[uint32]uint32
 	// defaultLocals contains the initial values of all non-parameter locals.
 	// It is nil if the function does not contain any reference type locals.
 	defaultLocals []value
