@@ -359,7 +359,7 @@ func (p *parser) parseFunction() (function, error) {
 		}
 	}
 
-	result, err := p.readCode(size, nil)
+	body, err := p.readCode(size, nil)
 	if err != nil {
 		return function{}, err
 	}
@@ -370,8 +370,6 @@ func (p *parser) parseFunction() (function, error) {
 	if _, err := io.Copy(io.Discard, p.reader); err != nil {
 		return function{}, err
 	}
-
-	body := result.bytecode
 
 	var defaultLocals []value
 	var hasRef bool
@@ -393,8 +391,6 @@ func (p *parser) parseFunction() (function, error) {
 	return function{
 		locals:        locals,
 		body:          body,
-		jumpCache:     result.jumpCache,
-		jumpElseCache: result.jumpElseCache,
 		defaultLocals: defaultLocals,
 	}, nil
 }
@@ -775,13 +771,9 @@ func (p *parser) parseElementSegment() (elementSegment, error) {
 }
 
 func (p *parser) parseExpression() ([]uint64, error) {
-	result, err := p.readCode(0, func(instruction []uint64) bool {
+	return p.readCode(0, func(instruction []uint64) bool {
 		return opcode(instruction[0]) == end
 	})
-	if err != nil {
-		return nil, err
-	}
-	return result.bytecode, nil
 }
 
 func (p *parser) parseLimits() (Limits, error) {
@@ -903,23 +895,8 @@ func getSectionOrder(id sectionId) int {
 	}
 }
 
-// controlEntry tracks a control flow instruction's position for building jump
-// caches.
-type controlEntry struct {
-	opcode opcode
-	pc     uint32 // Program counter of the first instruction in the block.
-}
-
-// bytecodeResult contains the parsed bytecode and precomputed jump caches.
-type bytecodeResult struct {
-	bytecode      []uint64
-	jumpCache     map[uint32]uint32
-	jumpElseCache map[uint32]uint32
-}
-
 // readCode decodes a sequence of WASM instructions into the flat uint64
-// bytecode the VM executes, and returns it with the jump caches that map each
-// block/if to its branch targets.
+// bytecode the compiler lowers to threaded instructions.
 //
 // Decoding stops at the first instruction for which isEnd returns true; a nil
 // isEnd decodes until the reader reaches EOF, which a function body's bounded
@@ -931,18 +908,12 @@ type bytecodeResult struct {
 func (p *parser) readCode(
 	sizeHint uint32,
 	isEnd func([]uint64) bool,
-) (bytecodeResult, error) {
+) ([]uint64, error) {
 	// sizeHint is attacker-controlled (the function body's declared size), so cap
 	// the initial capacity at maxInitialCapacity. The buffer still grows via
 	// append as real bytes are decoded; a bogus huge size cannot force a large
 	// up-front allocation.
 	bytecode := make([]uint64, 0, min(sizeHint, maxInitialCapacity))
-	// The jump caches are allocated lazily: a function with no control flow
-	// never branches, so it needs neither map.
-	var jumpCache map[uint32]uint32
-	var jumpElseCache map[uint32]uint32
-
-	controlStack := []controlEntry{}
 	var lastOp opcode
 
 	for {
@@ -951,7 +922,7 @@ func (p *parser) readCode(
 			if err == io.EOF {
 				break
 			}
-			return bytecodeResult{}, err
+			return nil, err
 		}
 
 		lastOp = opcodeVal
@@ -960,50 +931,15 @@ func (p *parser) readCode(
 
 		switch opcodeVal {
 		case block, loop, ifOp:
-			if jumpCache == nil {
-				jumpCache = map[uint32]uint32{}
-				jumpElseCache = map[uint32]uint32{}
-			}
 			immediate, err := p.readBlockType()
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 			bytecode = append(bytecode, immediate)
-			controlStack = append(controlStack, controlEntry{
-				opcode: opcodeVal,
-				pc:     uint32(len(bytecode)),
-			})
-		case elseOp:
-			if len(controlStack) > 0 {
-				top := &controlStack[len(controlStack)-1]
-				if top.opcode == ifOp {
-					jumpElseCache[top.pc] = uint32(len(bytecode))
-				}
-			}
-		case end:
-			if len(controlStack) > 0 {
-				top := controlStack[len(controlStack)-1]
-				controlStack = controlStack[:len(controlStack)-1]
-
-				// Loops branch back to their start so we do not need to cache their end
-				// position.
-				if top.opcode != loop {
-					jumpCache[top.pc] = uint32(len(bytecode))
-				}
-
-				// If this is an if without an else, record the position of the end
-				// opcode in the jumpElseCache as this is the opcode to execute if the
-				// if is not taken.
-				if top.opcode == ifOp {
-					if _, hasElse := jumpElseCache[top.pc]; !hasElse {
-						jumpElseCache[top.pc] = uint32(len(bytecode)) - 1
-					}
-				}
-			}
 		case i32Const:
 			immediate, err := p.readInt32()
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 			bytecode = append(bytecode, immediate)
 		case br,
@@ -1040,23 +976,23 @@ func (p *parser) readCode(
 			f64x2ReplaceLane:
 			immediate, err := p.readUint32()
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 			bytecode = append(bytecode, immediate)
 		case memorySize, memoryGrow:
 			immediate, err := p.reader.ReadByte()
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 			bytecode = append(bytecode, uint64(immediate))
 		case brTable:
 			vector, err := p.readImmediateVector()
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 			immediate, err := p.readUint32()
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 			bytecode = append(bytecode, uint64(len(vector)))
 			bytecode = append(bytecode, vector...)
@@ -1068,11 +1004,11 @@ func (p *parser) readCode(
 			tableCopy:
 			immediate1, err := p.readUint32()
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 			immediate2, err := p.readUint32()
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 			bytecode = append(bytecode, immediate1, immediate2)
 		case i32Load,
@@ -1114,38 +1050,38 @@ func (p *parser) readCode(
 			v128Store:
 			align, memoryIndex, offset, err := p.readMemArg()
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 			bytecode = append(bytecode, align, memoryIndex, offset)
 		case selectT:
 			vector, err := p.readImmediateVector()
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 			bytecode = append(bytecode, uint64(len(vector)))
 			bytecode = append(bytecode, vector...)
 		case i64Const:
 			immediate, err := p.readSleb128(10)
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 			bytecode = append(bytecode, immediate)
 		case f32Const:
 			immediate, err := p.readFloat32()
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 			bytecode = append(bytecode, immediate)
 		case f64Const:
 			immediate, err := p.readFloat64()
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 			bytecode = append(bytecode, immediate)
 		case v128Const:
 			bytes, err := p.readBytes(16)
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 
 			bytecode = append(
@@ -1163,19 +1099,19 @@ func (p *parser) readCode(
 			v128Store64Lane:
 			align, memoryIndex, offset, err := p.readMemArg()
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 
 			laneIndex, err := p.readUint8()
 			if err != nil {
-				return bytecodeResult{}, err
+				return nil, err
 			}
 			bytecode = append(bytecode, align, memoryIndex, offset, laneIndex)
 		case i8x16Shuffle:
 			for range 16 {
 				val, err := p.readUint8()
 				if err != nil {
-					return bytecodeResult{}, err
+					return nil, err
 				}
 				bytecode = append(bytecode, uint64(val))
 			}
@@ -1189,14 +1125,10 @@ func (p *parser) readCode(
 	}
 
 	if len(bytecode) == 0 || lastOp != end {
-		return bytecodeResult{}, errMissingEndOpcode
+		return nil, errMissingEndOpcode
 	}
 
-	return bytecodeResult{
-		bytecode:      bytecode,
-		jumpCache:     jumpCache,
-		jumpElseCache: jumpElseCache,
-	}, nil
+	return bytecode, nil
 }
 
 func (p *parser) readOpcode() (opcode, error) {

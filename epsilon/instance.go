@@ -177,6 +177,10 @@ type wasmFunction struct {
 	functionType FunctionType
 	module       *ModuleInstance
 	code         function
+	// instrs is the compilation of the function body, populated by vm.compile
+	// at instantiation before the function can be invoked; the run loop executes
+	// it directly.
+	instrs []instr
 }
 
 func (wf *wasmFunction) GetType() *FunctionType { return &wf.functionType }
