@@ -158,6 +158,11 @@ endif
 	  $(if $(BENCH_COUNT),--count=$(BENCH_COUNT),) \
 	  $(if $(filter-out .,$(BENCH_PATTERN)),--bench=$(BENCH_PATTERN),)
 
+bench-wazero: build-wasm ## Compare epsilon vs wazero compiler+interpreter (opt-in)
+	cd internal/benchmarks/wazerobench && \
+	  go test -bench=$(BENCH_PATTERN) -benchmem -benchtime=$(BENCH_TIME) \
+	    -count=$(BENCH_COUNT) -run='^$$' .
+
 # ----- benchmark .wasm builds -------------------------------------------------
 
 build-wasm: $(WASM_OUTPUTS) ## Rebuild benchmark .wasm files
