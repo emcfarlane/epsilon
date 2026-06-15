@@ -181,6 +181,10 @@ type wasmFunction struct {
 	// at instantiation before the function can be invoked; the run loop executes
 	// it directly.
 	instrs []instr
+	// costs holds the fuel charged per instr, parallel to instrs. It is only
+	// built when fuel is enabled (a fused instr costs as much as the opcodes it
+	// absorbs); otherwise it is nil and the no-fuel run loop never reads it.
+	costs []uint8
 }
 
 func (wf *wasmFunction) GetType() *FunctionType { return &wf.functionType }

@@ -381,7 +381,7 @@ func (vm *vm) invokeWasmFunction(function *wasmFunction) error {
 	// there are two loop implementations.
 	var err error
 	if vm.config.EnableFuel {
-		err = vm.runLoopWithFuel(call, function.instrs)
+		err = vm.runLoopWithFuel(call, function.instrs, function.costs)
 	} else {
 		err = vm.runLoop(call, function.instrs)
 	}
@@ -405,13 +405,18 @@ func (vm *vm) runLoop(c *callFrame, instructions []instr) error {
 	return c.trap
 }
 
-func (vm *vm) runLoopWithFuel(c *callFrame, instructions []instr) error {
+func (vm *vm) runLoopWithFuel(
+	c *callFrame, instructions []instr, costs []uint8,
+) error {
 	ip := 0
 	for uint(ip) < uint(len(instructions)) {
-		if vm.fuel == 0 {
+		// A fused instr charges the fuel of every opcode it absorbed, so the
+		// exhaustion point is identical to executing them unfused.
+		cost := uint64(costs[ip])
+		if vm.fuel < cost {
 			return errFuelExhausted
 		}
-		vm.fuel--
+		vm.fuel -= cost
 		in := &instructions[ip]
 		ip = in.fn(vm, c, ip, in)
 	}
@@ -463,11 +468,12 @@ func operandWordCount(op opcode, body []uint64, operandStart int) int {
 // accepted the module, so that signals a gap in the compiler, not bad input.
 
 func (vm *vm) compile(fn *wasmFunction) error {
-	instrs, err := vm.compileBody(&fn.code, fn.module)
+	instrs, costs, err := vm.compileBody(&fn.code, fn.module)
 	if err != nil {
 		return err
 	}
 	fn.instrs = instrs
+	fn.costs = costs
 	// instrs are the only runtime representation now; release the bytecode.
 	fn.code.body = nil
 	return nil
@@ -485,10 +491,25 @@ type ctrlEntry struct {
 // if headers are emitted with placeholder targets and back-patched when their
 // matching else/end is reached; br/br_if/br_table resolve their targets at run
 // time against the control stack, so they need no patching here.
-func (vm *vm) compileBody(fn *function, module *ModuleInstance) ([]instr, error) {
+func (vm *vm) compileBody(
+	fn *function, module *ModuleInstance,
+) ([]instr, []uint8, error) {
 	body := fn.body
 	code := make([]instr, 0, len(body))
 	var ctrl []ctrlEntry
+
+	// Opcode-fusion bookkeeping. Fused instrs are emitted in the localGet and
+	// i32Const cases below; fusing only ever merges adjacent data-stack opcodes,
+	// which are never branch targets, so the back-patched control targets stay
+	// correct. When fuel is enabled we record each fused instr's true cost so
+	// runLoopWithFuel charges the absorbed opcodes; otherwise the cost slice is
+	// left nil.
+	fuelOn := vm.config.EnableFuel
+	type fusedCost struct {
+		ip   int
+		cost uint8
+	}
+	var fused []fusedCost
 
 	for pc := 0; pc < len(body); {
 		op := opcode(body[pc])
@@ -566,7 +587,41 @@ func (vm *vm) compileBody(fn *function, module *ModuleInstance) ([]instr, error)
 		case selectT:
 			code = append(code, instr{fn: opSelect})
 		case localGet:
-			code = append(code, instr{fn: opLocalGet, a: body[pc+1]})
+			localIdx := body[pc+1]
+			next := pc + 2 // localGet is one operand word wide
+			if next < len(body) && opcode(body[next]) == i32Const {
+				constVal := body[next+1]
+				after := next + 2 // i32Const is one operand word wide
+				if after < len(body) && opcode(body[after]) == i32Add {
+					// localGet, i32Const, i32Add -> push local[a] + const.
+					code = append(code,
+						instr{fn: opLocalGetI32ConstAdd, a: localIdx, b: constVal})
+					if fuelOn {
+						fused = append(fused, fusedCost{len(code) - 1, 3})
+					}
+					pc = after + 1
+					continue
+				}
+				// localGet, i32Const -> push local[a] then const.
+				code = append(code,
+					instr{fn: opLocalGetI32Const, a: localIdx, b: constVal})
+				if fuelOn {
+					fused = append(fused, fusedCost{len(code) - 1, 2})
+				}
+				pc = after
+				continue
+			}
+			if next < len(body) && opcode(body[next]) == localGet {
+				// localGet, localGet -> push local[a] then local[b].
+				code = append(code,
+					instr{fn: opLocalGet2, a: localIdx, b: body[next+1]})
+				if fuelOn {
+					fused = append(fused, fusedCost{len(code) - 1, 2})
+				}
+				pc = next + 2
+				continue
+			}
+			code = append(code, instr{fn: opLocalGet, a: localIdx})
 		case localSet:
 			code = append(code, instr{fn: opLocalSet, a: body[pc+1]})
 		case localTee:
@@ -630,7 +685,18 @@ func (vm *vm) compileBody(fn *function, module *ModuleInstance) ([]instr, error)
 		case memoryGrow:
 			code = append(code, instr{fn: opMemoryGrow, a: body[pc+1]})
 		case i32Const:
-			code = append(code, instr{fn: opI32Const, a: body[pc+1]})
+			constVal := body[pc+1]
+			next := pc + 2 // i32Const is one operand word wide
+			if next < len(body) && opcode(body[next]) == i32Add {
+				// i32Const, i32Add -> add the constant to the stack top.
+				code = append(code, instr{fn: opI32ConstAdd, a: constVal})
+				if fuelOn {
+					fused = append(fused, fusedCost{len(code) - 1, 2})
+				}
+				pc = next + 1
+				continue
+			}
+			code = append(code, instr{fn: opI32Const, a: constVal})
 		case i64Const:
 			code = append(code, instr{fn: opI64Const, a: body[pc+1]})
 		case f32Const:
@@ -1413,11 +1479,22 @@ func (vm *vm) compileBody(fn *function, module *ModuleInstance) ([]instr, error)
 		case f64x2ConvertLowI32x4U:
 			code = append(code, instr{fn: opF64x2ConvertLowI32x4U})
 		default:
-			return nil, fmt.Errorf("unhandled opcode %d", opcode(body[pc]))
+			return nil, nil, fmt.Errorf("unhandled opcode %d", opcode(body[pc]))
 		}
 		pc += 1 + operandWordCount(op, body, pc+1)
 	}
-	return code, nil
+
+	var costs []uint8
+	if fuelOn {
+		costs = make([]uint8, len(code))
+		for i := range costs {
+			costs[i] = 1
+		}
+		for _, fc := range fused {
+			costs[fc.ip] = fc.cost
+		}
+	}
+	return code, costs, nil
 }
 
 // ---- instruction handlers ----
@@ -1463,6 +1540,33 @@ func opLocalSet(vm *vm, c *callFrame, ip int, in *instr) int {
 
 func opLocalTee(vm *vm, c *callFrame, ip int, in *instr) int {
 	c.locals[in.a] = vm.stack.data[len(vm.stack.data)-1]
+	return ip + 1
+}
+
+// opLocalGetI32Const fuses localGet+i32Const: push local[a] then the constant.
+func opLocalGetI32Const(vm *vm, c *callFrame, ip int, in *instr) int {
+	vm.stack.push(c.locals[in.a])
+	vm.stack.pushInt32(int32(in.b))
+	return ip + 1
+}
+
+// opLocalGet2 fuses localGet+localGet: push local[a] then local[b].
+func opLocalGet2(vm *vm, c *callFrame, ip int, in *instr) int {
+	vm.stack.push(c.locals[in.a])
+	vm.stack.push(c.locals[in.b])
+	return ip + 1
+}
+
+// opI32ConstAdd fuses i32Const+i32Add: add the constant to the stack top.
+func opI32ConstAdd(vm *vm, c *callFrame, ip int, in *instr) int {
+	top := len(vm.stack.data) - 1
+	vm.stack.data[top] = i32(vm.stack.data[top].int32() + int32(in.a))
+	return ip + 1
+}
+
+// opLocalGetI32ConstAdd fuses localGet+i32Const+i32Add: push local[a]+const.
+func opLocalGetI32ConstAdd(vm *vm, c *callFrame, ip int, in *instr) int {
+	vm.stack.pushInt32(c.locals[in.a].int32() + int32(in.b))
 	return ip + 1
 }
 
